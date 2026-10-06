@@ -37,6 +37,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -65,8 +66,9 @@ type PluginConfig struct {
 }
 
 var (
-	_ requestcontrol.DataProducer = &Producer{}
-	_ plugin.StateDumper          = &Producer{}
+	_ requestcontrol.DataProducer          = &Producer{}
+	_ requestcontrol.AdmissionDataProducer = &Producer{}
+	_ plugin.StateDumper                   = &Producer{}
 )
 
 // subscriberManager is the subset of kvevents.SubscriberManager the producer
@@ -290,7 +292,10 @@ func sortedCapped(in []string, limit int) []string {
 // Produces declares the PrefixCacheMatchInfoDataKey published per endpoint,
 // name-bound to this producer instance.
 func (p *Producer) Produces() map[plugin.DataKey]any {
-	return map[plugin.DataKey]any{p.dk: attrprefix.PrefixCacheMatchInfo{}}
+	return map[plugin.DataKey]any{
+		p.dk:             attrprefix.PrefixCacheMatchInfo{},
+		p.admissionKey(): admissionPrefix{},
+	}
 }
 
 // Consumes declares the TokenizedRequest dependency from token-producer so
@@ -324,26 +329,51 @@ func (p *Producer) Produce(ctx context.Context,
 		}
 	}
 
-	perPromptKeys, perPromptMMBlockIndices, err := computeBlockKeys(ctx, p.kvCacheIndexer, request, p.blockSizeTokens)
-	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
-		return fmt.Errorf("failed to compute block keys: %w", err)
+	var prepared *admissionPrefix
+	if request != nil {
+		prepared, _ = scheduling.ReadRequestAttribute[*admissionPrefix](request, p.admissionKey())
 	}
-	if len(perPromptKeys) == 0 {
+	if prepared == nil {
+		var err error
+		prepared, err = p.matchPrefix(ctx, request, endpoints)
+		if err != nil {
+			span.SetStatus(codes.Error, err.Error())
+			return err
+		}
+	}
+	if len(prepared.perPromptKeys) == 0 {
 		span.SetAttributes(semconv.LLMDEPPProducerResult("skipped_no_tokens"))
 		return nil
 	}
-
-	return p.produceFromBlockKeys(ctx, span, request, endpoints, perPromptKeys, perPromptMMBlockIndices)
+	if err := p.publishPreparedPrefix(ctx, prepared, endpoints); err != nil {
+		return err
+	}
+	if p.speculativeEnabled {
+		p.pluginState.Write(request.RequestID, blockKeysStateKey,
+			&blockKeysState{perPromptKeys: prepared.perPromptKeys})
+	}
+	span.SetAttributes(
+		semconv.LLMDEPPProducerTotalBlocks(prepared.totalBlocks),
+		semconv.LLMDEPPProducerMaxMatchBlocks(prepared.maxMatch),
+	)
+	return nil
 }
 
-// produceFromBlockKeys matches the per-prompt block keys against the index and
-// publishes per-endpoint PrefixCacheMatchInfo. perPromptKeys and
-// perPromptMMBlockIndices are computeBlockKeys' aligned return values.
-func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
-	request *scheduling.InferenceRequest, endpoints []scheduling.Endpoint,
+func (p *Producer) matchPrefix(ctx context.Context, request *scheduling.InferenceRequest, endpoints []scheduling.Endpoint) (*admissionPrefix, error) {
+	perPromptKeys, perPromptMMBlockIndices, err := computeBlockKeys(ctx, p.kvCacheIndexer, request, p.blockSizeTokens)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute block keys: %w", err)
+	}
+	if len(perPromptKeys) == 0 {
+		return &admissionPrefix{}, nil
+	}
+	return p.matchBlockKeys(ctx, endpoints, perPromptKeys, perPromptMMBlockIndices)
+}
+
+func (p *Producer) matchBlockKeys(ctx context.Context,
+	endpoints []scheduling.Endpoint,
 	perPromptKeys [][]kvblock.BlockHash, perPromptMMBlockIndices [][]int,
-) error {
+) (*admissionPrefix, error) {
 	logger := log.FromContext(ctx).WithName(p.typedName.String())
 	endpointSet := extractEndpointSet(endpoints)
 
@@ -359,8 +389,7 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 	for i, blockKeys := range perPromptKeys {
 		promptMatches, err := p.kvCacheIndexer.MatchBlockKeys(ctx, blockKeys, endpointSet)
 		if err != nil {
-			span.SetStatus(codes.Error, err.Error())
-			return fmt.Errorf("failed to match block keys: %w", err)
+			return nil, fmt.Errorf("failed to match block keys: %w", err)
 		}
 		totalBlocks += len(blockKeys)
 		if mmIdx := perPromptMMBlockIndices[i]; len(mmIdx) > 0 {
@@ -382,10 +411,10 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 	}
 
 	maxMatch := 0
-	results := make([]endpointResult, 0, len(endpoints))
+	results := make(map[fwkdl.ID]*attrprefix.PrefixCacheMatchInfo, len(endpoints))
 	for _, ep := range endpoints {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		md := ep.GetMetadata()
 		if md == nil {
@@ -407,26 +436,13 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		if mmTracked {
 			info.WithMM(attrprefix.MMMatchInfo{MatchBlocks: mmMatches[podKey]})
 		}
-		results = append(results, endpointResult{endpoint: ep, info: info})
+		results[md.ID] = info
 	}
-	if err := p.publishEndpointResults(ctx, results); err != nil {
-		return err
-	}
-
-	if p.speculativeEnabled {
-		p.pluginState.Write(request.RequestID, blockKeysStateKey,
-			&blockKeysState{perPromptKeys: perPromptKeys})
-	}
-
-	span.SetAttributes(
-		semconv.LLMDEPPProducerTotalBlocks(totalBlocks),
-		semconv.LLMDEPPProducerMaxMatchBlocks(maxMatch),
-	)
 
 	if v := logger.V(logging.TRACE); v.Enabled() {
-		v.Info("Produce completed", "blockKeys", totalBlocks, "matches", matches)
+		v.Info("Prefix matching completed", "blockKeys", totalBlocks, "matches", matches)
 	}
-	return nil
+	return &admissionPrefix{perPromptKeys: perPromptKeys, results: results, totalBlocks: totalBlocks, maxMatch: maxMatch}, nil
 }
 
 // addPodMatch sums b into a. A zero a (a pod first seen in a later prompt)
